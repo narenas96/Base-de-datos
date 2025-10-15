@@ -1,0 +1,301 @@
+---
+title: "eToro"
+authors: "TBD"
+date: today
+format: 
+  html:
+    embed-resources: true
+---
+
+# 📘 Feature Engineering Playbook for the eToro-like Mobile App Dataset
+
+This document explains your database schema, how data is populated, the five business-oriented feature queries we created (and why they matter), and how to use the resulting features in machine learning models—with concrete Python library suggestions.
+
+---
+
+## 1) Schema Overview
+
+Your schema models a retail trading platform with social and copy-trading capabilities. Key domains:
+
+### Identity, Access & Compliance
+
+* **`users`**: core user profile (email, phone, country, status).
+* **`user_auth`**: auth providers (password, Apple, Google) and MFA.
+* **`kyc_profiles`**: KYC status & documents (`pending/approved/...`).
+* **`risk_assessments`**: investor risk tier, score, timestamp.
+* **`regulatory_consents`**: acceptance of ToS, privacy, PDS, etc.
+
+### Devices, Telemetry & Notifications
+
+* **`devices` / `push_tokens`**: device fingerprint, push providers.
+* **`app_sessions`**: session start/end, IP, foreground flag, geo hints.
+* **`app_events`**: granular UI/SDK events with metadata JSON.
+* **`notifications`**: in-app/push messages with sent/opened timestamps.
+* **`attribution_installs`**: ad network/campaign attribution.
+
+### Currencies, Accounts & Ledger
+
+* **`currencies` / `exchange_rates`**: ISO codes and latest FX.
+* **`accounts`**: base currency, margin flag, lifecycle status.
+* **`account_balances`**: multi-currency balances per account.
+* **`ledger_entries`**: canonical cash book (trade fills, deposits, fees…).
+* **`payments`, `deposits`, `withdrawals`**: fiat/crypto funding flows.
+
+### Markets, Orders & Positions
+
+* **`instruments` / `instrument_prices`**: symbols, types, quotes.
+* **`orders` / `order_fills`**: intent & execution trail (side/type/TIF/status).
+* **`positions`**: inventory (qty, average price, open/closed).
+
+### Portfolios & Social
+
+* **`portfolios`, `portfolio_positions`**: user & smart portfolios.
+* **`smart_portfolios`, `smart_portfolio_allocations`**: rules-based products.
+* **`copy_trading_links`**: follower/leader links and allocation.
+* **`watchlists`, `watchlist_items`**: discovery/retention tool.
+* **`social_posts`, `social_comments`, `social_likes`, `follows`**: social graph.
+
+### Feature Store (new)
+
+* **`feat.user_features_core`**: equity, net deposits, money won, status label.
+* **`feat.user_features_onboarding`**: funnel timestamps & latencies.
+* **`feat.user_features_engagement_30d`**: sessions, events, push open rate.
+* **`feat.user_features_trading_90d`**: volume, win rate, realized P&L, diversity.
+* **`feat.user_features_concentration_open`**: HHI on open positions.
+* **`feat.user_features_social`**: social activity, influence & copy counts.
+
+---
+
+## 2) How Data Is Filled
+
+### Funding & Market Data
+
+* **Deposits/Withdrawals** flow via `payments`, linked to `accounts`.
+* **FX** uses `exchange_rates`; we take the *latest* rate per currency to convert to USD when computing features.
+* **Prices** use `instrument_prices`; we pick the *latest* per instrument.
+
+### Trading Data
+
+* **Orders & Fills**: realized trading P&L and behavioral metrics are computed from `orders` joined to `order_fills` and `instruments`.
+
+### Engagement & Social
+
+* **Sessions/Events**: engagement windows (30 days) summarize recent activity.
+* **Notifications**: sent vs opened to produce push open rate.
+* **Social Graph**: posts, comments, likes, follows, and active copy links.
+
+### ETL Pattern (Transactional & Idempotent)
+
+* We load each feature table with an **`INSERT ... ON CONFLICT DO UPDATE`** to upsert daily snapshots keyed by `(user_id, as_of_date)`.
+* Latest version provided uses:
+
+  * **Single transaction (`BEGIN`/`COMMIT`)** for atomicity.
+  * **Per-INSERT CTE blocks** (or TEMP tables) so intermediate computations exist in the same statement as the final `INSERT`.
+  * `COALESCE` everywhere to avoid `NULL` pollution.
+
+> If any step fails, the whole feature run rolls back cleanly.
+
+---
+
+## 3) Five Business-Oriented Feature Queries (and Why They Matter)
+
+These queries produce **model-ready features** to answer key business questions.
+
+### Q1) Onboarding speed & funnel completion
+
+**Business question:** *Who is likely to activate (deposit/trade) and how fast?*
+**Query summary:** Computes:
+
+* first install, KYC submit/review, first deposit/trade timestamps
+* latencies (hours) between each step
+* flags `deposited`, `traded`
+
+**Why it matters:** Speed through KYC and funding predicts **activation, LTV, and support need**.
+**Model uses:**
+
+* Classification: *Propensity-to-Deposit* / *Propensity-to-Trade*
+* Survival analysis: *Time to First Deposit/Trade*
+* Personalization: onboarding nudges & support prioritization
+
+---
+
+### Q2) 30-day engagement features
+
+**Business question:** *Who will churn? Who can be saved with the right nudge?*
+**Query summary:** In last 30 days:
+
+* session count, active days, event count
+* pushes sent & opened, **open rate**
+
+**Why it matters:** Behavioral signals are **top predictors of churn** and response to CRM.
+**Model uses:**
+
+* Churn prediction / retention uplift
+* Next-best-action for notification cadence & content
+
+---
+
+### Q3) 90-day trading behavior & performance
+
+**Business question:** *Who are good traders to copy? Who is growing risk?*
+**Query summary:** In last 90 days:
+
+* trade count, **win rate**, **avg notional (USD)**
+* **realized P&L (USD)**
+* # instruments & currencies traded (diversification / style)
+
+**Why it matters:** Captures **skill level**, **risk appetite**, and **style** for leaderboards & risk scoring.
+**Model uses:**
+
+* Learning-to-Rank for **CopyTrader** recommendations
+* Regression for expected P&L
+* Segmentation for education or limits
+
+---
+
+### Q4) Concentration risk on open positions
+
+**Business question:** *Who is dangerously concentrated or leveraged?*
+**Query summary:**
+
+* HHI (`sum(w^2)`) over open exposure weights (USD)
+* # distinct instruments open
+* margin enabled flag
+
+**Why it matters:** High concentration + leverage predicts **drawdowns** and **distress**.
+**Model uses:**
+
+* Risk-of-Loss classifier (7/30-day)
+* Anomaly detection for extreme concentration behavior
+* Dynamic margin/guardrails & education prompts
+
+---
+
+### Q5) Social & influence features
+
+**Business question:** *Who influences others? Who deserves discovery & copy?*
+**Query summary:**
+
+* Posts/comments/likes given
+* Likes/comments **received**
+* Followers
+* Active **copiers** (copy links not stopped)
+
+**Why it matters:** Social proof increases **copy-trading conversion** & **retention**.
+**Model uses:**
+
+* Ranking for *Who to Follow/Copy*
+* Graph features for influence & quality
+* Quality control (spam/low value detection)
+
+---
+
+## 4) How to Use These Features in ML
+
+### Labels (Targets)
+
+* **Profitability:** From `feat.user_features_core.money_won_usd` or derived ROI (`money_won_usd / net_dep_usd`).
+* **Churn:** Define label as *no sessions in next 30 days*.
+* **Activation:** Deposit/trade occurrence in the next 7/14/30 days.
+* **Risk:** Next-period drawdown or loss threshold breach.
+* **Copyability:** Future realized P&L or win rate; crowd engagement growth.
+
+### Feature Views (X)
+
+* Join on `(user_id, as_of_date)` across all six feature tables.
+* Use **look-ahead leakage guards**: ensure features are computed **only with data up to `as_of_date`**, and labels come **after** `as_of_date`.
+
+### Model Suggestions & Python Stack
+
+**General preprocessing**
+
+* `pandas`, `numpy`, `scikit-learn` (imputers, scalers, pipelines)
+* Categorical encoders: `category_encoders` (Target/WOE/Hash encoders)
+* Time series windows: `tsfresh` (optional) or custom rolling aggregates
+
+**Tabular models** (strong baselines)
+
+* **Gradient Boosted Trees:** `xgboost`, `lightgbm`, `catboost`
+
+  * Great with heterogeneous features, handle missingness well.
+* **Logistic/Linear Models:** `scikit-learn` for interpretable baselines.
+
+**Ranking & Recommenders**
+
+* **Learning to Rank:** `lightgbm` LTR, `xgboost` rank objective
+* **Implicit Feedback:** `implicit`, `lightfm`
+* **Graph**: `networkx` / `pyg` (PyTorch Geometric) for social influence signals.
+
+**Sequence & Time-aware**
+
+* **Temporal classification/regression:** `sktime`, `xgboost` on lagged features.
+* **Survival analysis:** `lifelines` for time-to-event (onboarding).
+
+**Causal/Uplift (CRM impact)**
+
+* `causalml`, `econml` for uplift modeling on retention/deposit campaigns.
+
+**Calibration & Monitoring**
+
+* **Calibration:** `sklearn.calibration.CalibratedClassifierCV`
+* **Drift & Monitoring:** `evidently`, `whylogs`, `great_expectations`
+
+### Example modeling snippets
+
+**Churn (binary classification)**
+
+```python
+import pandas as pd
+from sklearn.model_selection import train_test_split
+from lightgbm import LGBMClassifier
+from sklearn.metrics import roc_auc_score
+
+X = features_df.drop(columns=["label_churn_next_30d"])
+y = features_df["label_churn_next_30d"]
+
+X_train, X_test, y_train, y_test = train_test_split(X, y, stratify=y, test_size=0.2, random_state=42)
+clf = LGBMClassifier(n_estimators=800, learning_rate=0.03, num_leaves=63, subsample=0.8, colsample_bytree=0.8)
+clf.fit(X_train, y_train)
+
+print("AUC:", roc_auc_score(y_test, clf.predict_proba(X_test)[:,1]))
+```
+
+**Copy-leader ranking (LTR with LightGBM)**
+
+* Build pairwise/listwise datasets where *items* are candidate leaders and *queries* are followers or time buckets; label with future realized P&L or copy uptake.
+
+**Uplift for retention pushes**
+
+* Train two-model or meta-learner with `econml`/`causalml` to estimate **Incremental Response** to push campaigns using engagement features.
+
+### Offline → Online
+
+* **Offline training:** Use backfilled snapshots `(user_id, as_of_date)` and labels at `as_of_date + horizon`.
+* **Online serving:** Refresh feature tables daily/hourly; expose a **feature service** that returns the latest row per user.
+* **A/B tests:** Use model scores to target CRM or rank leaders, then measure uplift.
+
+---
+
+## 5) Practical Tips
+
+* **Backfilling:** add an `as_of_date` parameter to the ETL and iterate over a historical date range to create training sets.
+* **Data Quality:** add NOT NULL/selective constraints to feature tables only if you can guarantee completeness; otherwise validate with checks and dashboards.
+* **Explainability:** export feature importances (GBDT), partial dependence, SHAP for stakeholder trust.
+* **Governance:** keep a versioned **data dictionary** and record ETL code hashes per `as_of_date` to keep experiments reproducible.
+
+---
+
+## 6) What’s Next (optional enhancements)
+
+* Add **ROI%** and **drawdown** features to `feat.user_features_core`.
+* Create **materialized views** for the latest snapshot (`WHERE as_of_date = CURRENT_DATE`).
+* Build **label tables** (`feat.labels_*`) for clean supervised training pipelines.
+* Wrap the ETL into **dbt** models with tests and documentation.
+
+---
+
+If you want, I can:
+
+* Generate a **parametrized backfill ETL** (date range).
+* Provide a **dbt project skeleton** (models, tests, docs).
+* Share **notebooks** to train 2–3 starter models (churn, copy-leader rank, profitability).
